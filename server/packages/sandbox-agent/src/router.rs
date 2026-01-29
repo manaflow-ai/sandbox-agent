@@ -924,6 +924,15 @@ impl AgentServerManager {
         *self.owner.lock().expect("owner lock") = Some(owner);
     }
 
+    /// Check if an agent server is currently running (fast path to skip install check)
+    async fn is_server_running(&self, agent: AgentId) -> bool {
+        let servers = self.servers.lock().await;
+        servers
+            .get(&agent)
+            .map(|s| matches!(s.status, ServerStatus::Running))
+            .unwrap_or(false)
+    }
+
     #[cfg(feature = "test-utils")]
     async fn set_owner_async(&self, owner: Weak<SessionManager>) {
         *self.owner.lock().expect("owner lock") = Some(owner);
@@ -1527,24 +1536,32 @@ impl SessionManager {
         }
 
         if agent_id != AgentId::Mock {
-            let manager = self.agent_manager.clone();
-            let agent_version = request.agent_version.clone();
-            let agent_name = request.agent.clone();
-            let install_result = tokio::task::spawn_blocking(move || {
-                manager.install(
-                    agent_id,
-                    InstallOptions {
-                        reinstall: false,
-                        version: agent_version,
-                    },
-                )
-            })
-            .await
-            .map_err(|err| SandboxError::InstallFailed {
-                agent: agent_name,
-                stderr: Some(err.to_string()),
-            })?;
-            install_result.map_err(|err| map_install_error(agent_id, err))?;
+            // For shared-server agents (OpenCode/Codex), skip install check if server is already running.
+            // This eliminates ~100ms overhead on warm sessions since the binary must already be installed.
+            let uses_shared_server = matches!(agent_id, AgentId::Opencode | AgentId::Codex);
+            let server_running =
+                uses_shared_server && self.server_manager.is_server_running(agent_id).await;
+
+            if !server_running {
+                let manager = self.agent_manager.clone();
+                let agent_version = request.agent_version.clone();
+                let agent_name = request.agent.clone();
+                let install_result = tokio::task::spawn_blocking(move || {
+                    manager.install(
+                        agent_id,
+                        InstallOptions {
+                            reinstall: false,
+                            version: agent_version,
+                        },
+                    )
+                })
+                .await
+                .map_err(|err| SandboxError::InstallFailed {
+                    agent: agent_name,
+                    stderr: Some(err.to_string()),
+                })?;
+                install_result.map_err(|err| map_install_error(agent_id, err))?;
+            }
         }
 
         let mut session = SessionState::new(session_id.clone(), agent_id, &request)?;
