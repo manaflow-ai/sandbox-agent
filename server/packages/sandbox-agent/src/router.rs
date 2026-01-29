@@ -139,6 +139,34 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
     state.session_manager.server_manager.shutdown().await;
 }
 
+/// Prewarm agent servers (Codex, OpenCode) for faster first session creation.
+/// This spawns the shared servers in the background without waiting for completion.
+pub async fn prewarm_agents(state: &Arc<AppState>) {
+    tracing::info!("prewarming agent servers");
+
+    // Prewarm Codex (shared JSON-RPC server)
+    let session_manager = state.session_manager.clone();
+    let codex_handle = tokio::spawn(async move {
+        match session_manager.prewarm_codex().await {
+            Ok(_) => tracing::info!("codex server prewarmed"),
+            Err(e) => tracing::warn!(error = %e, "failed to prewarm codex server"),
+        }
+    });
+
+    // Prewarm OpenCode (HTTP server)
+    let session_manager = state.session_manager.clone();
+    let opencode_handle = tokio::spawn(async move {
+        match session_manager.prewarm_opencode().await {
+            Ok(_) => tracing::info!("opencode server prewarmed"),
+            Err(e) => tracing::warn!(error = %e, "failed to prewarm opencode server"),
+        }
+    });
+
+    // Wait for both to complete
+    let _ = tokio::join!(codex_handle, opencode_handle);
+    tracing::info!("agent server prewarm complete");
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1119,7 +1147,9 @@ impl AgentServerManager {
 
     async fn wait_for_http_server(&self, base_url: &str) -> Result<(), SandboxError> {
         let endpoints = ["health", "healthz", "app/agents", "agents"];
-        for _ in 0..20 {
+        // 50 iterations × 150ms = 7.5 seconds max wait time
+        // OpenCode needs ~5s to start due to plugin initialization
+        for _ in 0..50 {
             for endpoint in endpoints {
                 let url = format!("{base_url}/{endpoint}");
                 if let Ok(response) = self.http_client.get(&url).send().await {
@@ -2768,6 +2798,56 @@ impl SessionManager {
         self.server_manager
             .ensure_http_server(AgentId::Opencode)
             .await
+    }
+
+    /// Prewarm the OpenCode HTTP server without creating a session.
+    pub async fn prewarm_opencode(&self) -> Result<(), SandboxError> {
+        // First ensure the agent is installed
+        let manager = self.agent_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.install(
+                AgentId::Opencode,
+                InstallOptions {
+                    reinstall: false,
+                    version: None,
+                },
+            )
+        })
+        .await
+        .map_err(|e| SandboxError::InstallFailed {
+            agent: "opencode".to_string(),
+            stderr: Some(e.to_string()),
+        })?
+        .map_err(|e| map_install_error(AgentId::Opencode, e))?;
+
+        // Then start the server
+        self.ensure_opencode_server().await?;
+        Ok(())
+    }
+
+    /// Prewarm the Codex JSON-RPC server without creating a session.
+    pub async fn prewarm_codex(self: &Arc<Self>) -> Result<(), SandboxError> {
+        // First ensure the agent is installed
+        let manager = self.agent_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.install(
+                AgentId::Codex,
+                InstallOptions {
+                    reinstall: false,
+                    version: None,
+                },
+            )
+        })
+        .await
+        .map_err(|e| SandboxError::InstallFailed {
+            agent: "codex".to_string(),
+            stderr: Some(e.to_string()),
+        })?
+        .map_err(|e| map_install_error(AgentId::Codex, e))?;
+
+        // Then start the server and do the initialize handshake
+        self.ensure_codex_server().await?;
+        Ok(())
     }
 
     /// Ensures a shared Codex app-server process is running.

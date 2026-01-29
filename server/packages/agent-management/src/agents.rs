@@ -138,9 +138,10 @@ impl AgentManager {
         let install_path = self.binary_path(agent);
         if !options.reinstall {
             if let Ok(existing_path) = self.resolve_binary(agent) {
+                // Skip expensive version check - binary exists and we're not reinstalling
                 return Ok(InstallResult {
                     path: existing_path,
-                    version: self.version(agent).unwrap_or(None),
+                    version: None,
                 });
             }
         }
