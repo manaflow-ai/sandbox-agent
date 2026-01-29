@@ -1479,10 +1479,11 @@ impl AgentServerManager {
 impl SessionManager {
     fn new(agent_manager: Arc<AgentManager>) -> Self {
         let log_base_dir = default_log_dir();
-        // Configure HTTP client with appropriate timeouts
+        // Configure HTTP client for low-latency local requests
         let http_client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true) // Disable Nagle's algorithm for faster small packets
             .build()
             .unwrap_or_else(|_| Client::new());
         let server_manager = Arc::new(AgentServerManager::new(
