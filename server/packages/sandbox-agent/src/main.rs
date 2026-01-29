@@ -6,7 +6,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
-use sandbox_agent::router::{build_router_with_state, shutdown_servers};
+use sandbox_agent::router::{build_router_with_state, prewarm_agents, shutdown_servers};
 use sandbox_agent::router::{
     AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest,
     PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
@@ -85,6 +85,10 @@ struct ServerArgs {
 
     #[arg(long = "no-telemetry")]
     no_telemetry: bool,
+
+    /// Prewarm agent servers (OpenCode, Codex) on startup for faster first session
+    #[arg(long = "prewarm")]
+    prewarm: bool,
 }
 
 #[derive(Args, Debug)]
@@ -404,10 +408,14 @@ fn run_server(cli: &Cli, server: &ServerArgs) -> Result<(), CliError> {
 
     let telemetry_enabled = telemetry::telemetry_enabled(server.no_telemetry);
 
+    let prewarm = server.prewarm;
     runtime.block_on(async move {
         if telemetry_enabled {
             telemetry::log_enabled_message();
             telemetry::spawn_telemetry_task();
+        }
+        if prewarm {
+            prewarm_agents(&state).await;
         }
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!(addr = %addr, "server listening");
