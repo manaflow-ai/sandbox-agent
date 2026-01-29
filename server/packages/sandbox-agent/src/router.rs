@@ -1147,9 +1147,18 @@ impl AgentServerManager {
 
     async fn wait_for_http_server(&self, base_url: &str) -> Result<(), SandboxError> {
         let endpoints = ["health", "healthz", "app/agents", "agents"];
-        // 50 iterations × 150ms = 7.5 seconds max wait time
-        // OpenCode needs ~5s to start due to plugin initialization
-        for _ in 0..50 {
+        // Use exponential backoff: start fast, slow down over time
+        // Total max wait: ~10 seconds
+        let delays_ms = [
+            50, 50, 50, 50, 100, 100, 100, 100,  // 600ms for first 8 attempts
+            150, 150, 150, 150, 150, 150,        // 900ms for next 6
+            200, 200, 200, 200, 200,             // 1000ms for next 5
+            250, 250, 250, 250,                  // 1000ms for next 4
+            300, 300, 300, 300,                  // 1200ms for next 4
+            400, 400, 400, 400,                  // 1600ms for next 4
+            500, 500, 500, 500,                  // 2000ms for last 4
+        ];
+        for delay in delays_ms {
             for endpoint in endpoints {
                 let url = format!("{base_url}/{endpoint}");
                 if let Ok(response) = self.http_client.get(&url).send().await {
@@ -1158,7 +1167,7 @@ impl AgentServerManager {
                     }
                 }
             }
-            sleep(Duration::from_millis(150)).await;
+            sleep(Duration::from_millis(delay)).await;
         }
         Err(SandboxError::StreamError {
             message: "server health check failed".to_string(),
@@ -1461,9 +1470,15 @@ impl AgentServerManager {
 impl SessionManager {
     fn new(agent_manager: Arc<AgentManager>) -> Self {
         let log_base_dir = default_log_dir();
+        // Configure HTTP client with appropriate timeouts
+        let http_client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         let server_manager = Arc::new(AgentServerManager::new(
             agent_manager.clone(),
-            Client::new(),
+            http_client.clone(),
             log_base_dir,
             true,
         ));
@@ -1471,7 +1486,7 @@ impl SessionManager {
             agent_manager,
             sessions: Mutex::new(Vec::new()),
             server_manager,
-            http_client: Client::new(),
+            http_client,
         }
     }
 
@@ -3136,17 +3151,19 @@ impl SessionManager {
     async fn create_opencode_session(&self) -> Result<String, SandboxError> {
         let base_url = self.ensure_opencode_server().await?;
         let url = format!("{base_url}/session");
-        for _ in 0..10 {
+        // Shorter retries with exponential backoff - server should be ready
+        let delays_ms = [50, 100, 150, 200, 300];
+        for delay in delays_ms {
             let response = self.http_client.post(&url).json(&json!({})).send().await;
             let response = match response {
                 Ok(response) => response,
                 Err(_) => {
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(Duration::from_millis(delay)).await;
                     continue;
                 }
             };
             if !response.status().is_success() {
-                sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(delay)).await;
                 continue;
             }
             let value: Value = response
@@ -3169,7 +3186,7 @@ impl SessionManager {
             });
         }
         Err(SandboxError::StreamError {
-            message: "OpenCode session create failed after retries".to_string(),
+            message: "OpenCode session create failed after 5 retries".to_string(),
         })
     }
 
