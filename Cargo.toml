@@ -28,12 +28,12 @@ thiserror = "1.0"
 
 # Schema generation
 schemars = "0.8"
-utoipa = { version = "4.2", features = ["axum_extras"] }
+utoipa = { version = "5.4", features = ["axum_extras"] }
 
 # Web framework
-axum = "0.7"
+axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Async runtime
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "signal", "time"] }
