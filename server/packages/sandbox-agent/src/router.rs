@@ -91,28 +91,29 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>) {
+    // Note: Axum 0.8 uses {param} syntax instead of :param
     let mut v1_router = Router::new()
         .route("/health", get(get_health))
         .route("/agents", get(list_agents))
-        .route("/agents/:agent/install", post(install_agent))
-        .route("/agents/:agent/modes", get(get_agent_modes))
+        .route("/agents/{agent}/install", post(install_agent))
+        .route("/agents/{agent}/modes", get(get_agent_modes))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/:session_id", post(create_session))
-        .route("/sessions/:session_id/messages", post(post_message))
-        .route("/sessions/:session_id/messages/stream", post(post_message_stream))
-        .route("/sessions/:session_id/terminate", post(terminate_session))
-        .route("/sessions/:session_id/events", get(get_events))
-        .route("/sessions/:session_id/events/sse", get(get_events_sse))
+        .route("/sessions/{session_id}", post(create_session))
+        .route("/sessions/{session_id}/messages", post(post_message))
+        .route("/sessions/{session_id}/messages/stream", post(post_message_stream))
+        .route("/sessions/{session_id}/terminate", post(terminate_session))
+        .route("/sessions/{session_id}/events", get(get_events))
+        .route("/sessions/{session_id}/events/sse", get(get_events_sse))
         .route(
-            "/sessions/:session_id/questions/:question_id/reply",
+            "/sessions/{session_id}/questions/{question_id}/reply",
             post(reply_question),
         )
         .route(
-            "/sessions/:session_id/questions/:question_id/reject",
+            "/sessions/{session_id}/questions/{question_id}/reject",
             post(reject_question),
         )
         .route(
-            "/sessions/:session_id/permissions/:permission_id/reply",
+            "/sessions/{session_id}/permissions/{permission_id}/reply",
             post(reply_permission),
         )
         .with_state(shared.clone());
