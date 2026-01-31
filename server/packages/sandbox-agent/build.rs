@@ -28,10 +28,10 @@ fn main() {
     }
 
     if !dist_dir.exists() {
-        panic!(
-            "Inspector frontend missing at {}. Run `pnpm --filter @sandbox-agent/inspector build` (or `pnpm -C frontend/packages/inspector build`) or set SANDBOX_AGENT_SKIP_INSPECTOR=1 to skip embedding.",
-            dist_dir.display()
-        );
+        // When used as a library dependency, the inspector frontend may not be available.
+        // Skip embedding it in this case instead of failing the build.
+        write_disabled(&out_file);
+        return;
     }
 
     let dist_literal = quote_path(&dist_dir);
