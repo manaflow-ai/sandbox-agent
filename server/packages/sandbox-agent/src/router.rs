@@ -790,6 +790,8 @@ struct CodexServer {
     initialized: std::sync::Mutex<bool>,
     /// Mapping from thread_id to session_id for routing notifications
     thread_sessions: std::sync::Mutex<HashMap<String, String>>,
+    /// Pool of pre-created threads for fast session creation
+    thread_pool: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
 impl std::fmt::Debug for CodexServer {
@@ -808,7 +810,25 @@ impl CodexServer {
             next_id: AtomicI64::new(1),
             initialized: std::sync::Mutex::new(false),
             thread_sessions: std::sync::Mutex::new(HashMap::new()),
+            thread_pool: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Take a pre-created thread from the pool, if available
+    fn take_pooled_thread(&self) -> Option<String> {
+        let mut pool = self.thread_pool.lock().unwrap();
+        pool.pop_front()
+    }
+
+    /// Add a thread to the pool
+    fn add_to_pool(&self, thread_id: String) {
+        let mut pool = self.thread_pool.lock().unwrap();
+        pool.push_back(thread_id);
+    }
+
+    /// Get the current pool size
+    fn pool_size(&self) -> usize {
+        self.thread_pool.lock().unwrap().len()
     }
 
     fn next_request_id(&self) -> i64 {
@@ -2859,6 +2879,7 @@ impl SessionManager {
     }
 
     /// Prewarm the Codex JSON-RPC server without creating a session.
+    /// Also pre-creates threads for fast session creation.
     pub async fn prewarm_codex(self: &Arc<Self>) -> Result<(), SandboxError> {
         // First ensure the agent is installed
         let manager = self.agent_manager.clone();
@@ -2879,8 +2900,68 @@ impl SessionManager {
         .map_err(|e| map_install_error(AgentId::Codex, e))?;
 
         // Then start the server and do the initialize handshake
-        self.ensure_codex_server().await?;
+        let server = self.ensure_codex_server().await?;
+
+        // Pre-create threads for fast session creation
+        const PREWARM_THREAD_COUNT: usize = 3;
+        let mut handles = Vec::new();
+        for _ in 0..PREWARM_THREAD_COUNT {
+            let server_clone = server.clone();
+            let self_clone = Arc::clone(self);
+            handles.push(tokio::spawn(async move {
+                self_clone.create_pooled_codex_thread(&server_clone).await
+            }));
+        }
+        for handle in handles {
+            if let Ok(Ok(thread_id)) = handle.await {
+                server.add_to_pool(thread_id);
+            }
+        }
+        tracing::info!(pool_size = server.pool_size(), "codex thread pool initialized");
+
         Ok(())
+    }
+
+    /// Create a thread for the pool (without associating it to a session yet)
+    async fn create_pooled_codex_thread(
+        &self,
+        server: &Arc<CodexServer>,
+    ) -> Result<String, SandboxError> {
+        let id = server.next_request_id();
+        let params = codex_schema::ThreadStartParams::default();
+
+        let request = codex_schema::ClientRequest::ThreadStart {
+            id: codex_schema::RequestId::from(id),
+            params,
+        };
+
+        let rx = server
+            .send_request(id, &request)
+            .ok_or_else(|| SandboxError::StreamError {
+                message: "failed to send thread/start request".to_string(),
+            })?;
+
+        let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        match result {
+            Ok(Ok(response)) => {
+                let thread_id = response
+                    .get("thread")
+                    .and_then(|t| t.get("id"))
+                    .and_then(Value::as_str)
+                    .or_else(|| response.get("threadId").and_then(Value::as_str))
+                    .ok_or_else(|| SandboxError::StreamError {
+                        message: "thread/start response missing thread id".to_string(),
+                    })?
+                    .to_string();
+                Ok(thread_id)
+            }
+            Ok(Err(_)) => Err(SandboxError::StreamError {
+                message: "thread/start request cancelled".to_string(),
+            }),
+            Err(_) => Err(SandboxError::StreamError {
+                message: "thread/start request timed out".to_string(),
+            }),
+        }
     }
 
     /// Ensures a shared Codex app-server process is running.
@@ -3034,12 +3115,41 @@ impl SessionManager {
     }
 
     /// Creates a new Codex thread/session via the shared app-server.
+    /// Uses pre-warmed threads from the pool when available for faster session creation.
     async fn create_codex_thread(
         self: &Arc<Self>,
         session_id: &str,
         session: &SessionSnapshot,
     ) -> Result<String, SandboxError> {
         let server = self.ensure_codex_server().await?;
+
+        // Try to use a pre-warmed thread from the pool first
+        if let Some(thread_id) = server.take_pooled_thread() {
+            tracing::info!(
+                thread_id = %thread_id,
+                pool_remaining = server.pool_size(),
+                "using pooled codex thread"
+            );
+            // Register thread -> session mapping
+            server.register_thread(thread_id.clone(), session_id.to_string());
+
+            // Trigger background pool replenishment if running low
+            if server.pool_size() < 2 {
+                let self_clone = Arc::clone(self);
+                let server_clone = server.clone();
+                tokio::spawn(async move {
+                    if let Ok(new_thread_id) = self_clone.create_pooled_codex_thread(&server_clone).await {
+                        server_clone.add_to_pool(new_thread_id);
+                        tracing::debug!(pool_size = server_clone.pool_size(), "replenished codex thread pool");
+                    }
+                });
+            }
+
+            return Ok(thread_id);
+        }
+
+        // Fall back to creating a new thread if pool is empty
+        tracing::debug!("codex thread pool empty, creating new thread");
 
         let id = server.next_request_id();
         let mut params = codex_schema::ThreadStartParams::default();
